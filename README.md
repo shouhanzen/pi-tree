@@ -20,6 +20,8 @@ This repo explores a model where:
 - subagents inherit a snapshot of the parent's effective context
 - compaction is per-agent, not shared globally
 - live/dead zone spans are projected back into parent context
+- persistent agents can later receive new user turns in place via `message_subagent`
+- completed subtrees can be softly hidden via archive/unarchive semantics
 
 ## Extension source
 
@@ -39,5 +41,7 @@ Sandbox/runtime files are ignored and written under:
 
 1. Start pi normally and `/reload`
 2. Ask pi to use `spawn_subagent`
-3. Inspect `PLAN.md` when iterating on the design
-4. Use this repo as the canonical source for future TUI and runtime iterations
+3. Use `join_subagent` when you need a synchronization barrier
+4. Use `message_subagent` to continue an existing persistent agent in place
+5. Use `archive_subagent` / `unarchive_subagent` to manage tree clutter
+6. Inspect `PLAN.md`, `PLAN_JOIN.md`, and `PLAN_PERSISTENT_AGENTS.md` when iterating on the design

@@ -289,6 +289,68 @@ This suggests the extension should provide at least:
 - runtime liveness tracking
 - recursive child spawning by inheriting the same extension/runtime
 
+## TUI direction
+
+The current preferred TUI is a **three-column split view**:
+
+### Left column: root/orca pane
+- looks like the normal pi interface
+- receives new user messages
+- does **not** inline full subagent transcripts
+- instead shows lightweight clickable subagent event markers for:
+  - spawn
+  - join
+  - kill
+- clicking a marker focuses the exact referenced subagent in the middle pane
+
+### Middle column: selected subagent pane
+- looks as close as possible to the regular pi message interface
+- shows the selected subagent's own conversation/span in detail
+- if the selected subagent is alive, it live-updates
+- auto-follow only if the user is already at the bottom
+- if the user has scrolled away, preserve scroll and use unread/activity indication instead
+- nested workers should not fully inline their full transcripts here
+- instead nested workers appear as compact clickable markers/cards inline at their structural points
+- each nested marker should show:
+  - human name first
+  - short agent ID second
+  - live/dead state
+  - a one-line summary/snippet when possible
+
+### Right column: tree navigator
+- collapsible
+- shows the full historical agent tree, not just live agents
+- live and dead nodes remain visible
+- dead nodes are historical only and cannot be directly followed up with
+- continued work must go back through the trunk/orca agent
+- when a node is selected anywhere, the tree auto-opens/scrolls/highlights that exact node
+- when there is activity in a non-selected worker, the signal should appear in the tree pane only
+- unread/new activity is the first important secondary badge on nodes
+- node labels should be name-first, short-ID-second
+
+### Selection defaults
+- if no subagent exists, the middle pane shows a lightweight instructional placeholder
+- if subagents exist, default the middle pane to the latest relevant/referenced worker if possible
+- selecting a dead node should still show its full historical span/transcript
+
+## Future model idea: persistent/messageable agents
+
+A new direction to explore is that subagents may eventually become **messageable**.
+
+This implies a stronger model:
+- zones are not destroyed on completion
+- zones persist until the agent itself is explicitly deleted
+- completion is not equivalent to destruction
+- a completed agent can remain addressable via its persistent zone
+
+This begins to look like an **agent filesystem**:
+- agents persist as addressable entities
+- zones act like stable locations / mounts / spans in the structure
+- completion changes liveness state, not existence
+- later follow-up may become possible without forcing kill+respawn in every case
+
+This is not yet the current finalized implementation model, but it is an important next design branch to evaluate.
+
 ## Current implementation status
 
 Already validated in the sandbox:
@@ -302,11 +364,13 @@ Already validated in the sandbox:
 - projection has been refactored from a flatter routed-context dump toward explicit zone-span rendering
 - runtime liveness refresh exists and can mark remote agents dead when their terminal events/process death are observed
 - custom compaction hook exists and includes current span projection in the compaction prompt
+- `join_subagent` exists as a synchronization barrier for a target subtree
 
 Still incomplete / future work:
 1. Further improve span projection so dead-zone dissipation and append tails are even closer to the ideal model
 2. Harden runtime liveness/process cleanup further, especially around PID reuse and interrupted sessions
 3. Improve the quality and structure of custom compaction summaries
-4. UI beyond “it works”
+4. Build the three-pane TUI described above
 5. Tool/mutation permissions per agent class
-6. Guardrails if recursive sibling cross-talk gets too noisy in practice
+6. Evaluate the persistent/messageable-agent model and how it changes zone lifecycle semantics
+7. Guardrails if recursive sibling cross-talk gets too noisy in practice

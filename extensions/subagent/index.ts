@@ -7,6 +7,7 @@ import {
 	EXTENSION_NAME,
 	type AgentMeta,
 	type ZoneEvent,
+	archiveAgentSubtree,
 	buildVisibleZoneIds,
 	emitZoneEvent,
 	extractTextFromContent,
@@ -18,11 +19,13 @@ import {
 	markAgentAlive,
 	renderProjectionMarkdown,
 	renderSessionBranchSnapshot,
+	resumeAgentProcess,
 	randomId,
 	refreshAgentLiveness,
 	spawnChildProcess,
 	syncVisibleEvents,
 	type RuntimePaths,
+	unarchiveAgentSubtree,
 } from "./runtime.js";
 
 const EXTENSION_FILE_PATH =
@@ -154,6 +157,69 @@ async function joinAgentSubtree(
 		caller.lastStatusAt = refreshed.lastStatusAt;
 		caller.pid = refreshed.pid;
 	}
+}
+
+function buildResumeSnapshot(
+	ctx: ExtensionContext,
+	paths: RuntimePaths,
+	caller: AgentMeta,
+	target: AgentMeta,
+	message: string,
+): string {
+	const callerProjection = buildProjectionMessage(paths, caller);
+	const targetProjection = buildProjectionMessage(paths, target);
+	return [
+		"# Resume snapshot",
+		"",
+		`Caller agent: ${caller.agentId} (${caller.name})`,
+		`Target agent: ${target.agentId} (${target.name})`,
+		`Target zone: ${target.zoneId}`,
+		`Resume created: ${nowIso()}`,
+		"",
+		"# Target conversation view",
+		"",
+		targetProjection || "(no routed projection yet)",
+		"",
+		"# Caller view",
+		"",
+		callerProjection || "(no caller projection)",
+		"",
+		"# New user message",
+		"",
+		message,
+	].join("\n");
+}
+
+async function resumeAgentWithMessage(
+	ctx: ExtensionContext,
+	paths: RuntimePaths,
+	caller: AgentMeta,
+	targetAgentId: string,
+	message: string,
+	thinkingLevel?: string,
+): Promise<AgentToolResult<Record<string, unknown>>> {
+	const target = getAgentMeta(paths, targetAgentId);
+	if (!target) throw new Error(`Unknown agent: ${targetAgentId}`);
+	if (target.archived) throw new Error(`Archived agent cannot receive messages: ${targetAgentId}`);
+	const snapshotMarkdown = buildResumeSnapshot(ctx, paths, caller, target, message);
+	const resumed = resumeAgentProcess(paths, targetAgentId, {
+		name: target.name,
+		task: message,
+		snapshotMarkdown,
+		extensionPath: EXTENSION_FILE_PATH,
+		model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
+		thinkingLevel,
+		appendSystemPrompt: [
+			`You are resuming persistent subagent ${target.name} (${target.agentId}).`,
+			`Keep the same identity, zone, and transcript.`,
+			`Treat the new user message as the next normal turn in this same conversation.`,
+		].join("\n"),
+	});
+	emitZoneEvent(paths, makeEvent(caller, "status", { text: `zone push to ${targetAgentId}` }));
+	return {
+		content: [{ type: "text", text: `Messaged ${resumed.agentId}.` }],
+		details: { ok: true, agentId: resumed.agentId, resumed: true },
+	};
 }
 
 async function buildCompactionSummary(
@@ -415,6 +481,68 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 		},
 	});
 
+	pi.registerCommand("subagent-message", {
+		description: "Send a new user message to a persistent subagent conversation",
+		handler: async (args, ctx) => {
+			const trimmed = args.trim();
+			const firstSpace = trimmed.indexOf(" ");
+			if (!trimmed || firstSpace === -1) {
+				ctx.ui.notify("Usage: /subagent-message <agent-id> <message>", "warning");
+				return;
+			}
+			const agentId = trimmed.slice(0, firstSpace).trim();
+			const message = trimmed.slice(firstSpace + 1).trim();
+			const { agent, paths } = requireState();
+			try {
+				const result = await resumeAgentWithMessage(ctx, paths, agent, agentId, message, pi.getThinkingLevel());
+				updateStatus(ctx, paths, agent);
+				ctx.ui.notify(extractTextFromContent(result.content), "success");
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+			}
+		},
+	});
+
+	pi.registerCommand("subagent-archive", {
+		description: "Archive a completed subagent subtree (soft hide)",
+		handler: async (args, ctx) => {
+			const agentId = args.trim();
+			if (!agentId) {
+				ctx.ui.notify("Usage: /subagent-archive <agent-id>", "warning");
+				return;
+			}
+			const { agent, paths } = requireState();
+			const target = getAgentMeta(paths, agentId);
+			if (!target) {
+				ctx.ui.notify(`Unknown agent: ${agentId}`, "error");
+				return;
+			}
+			archiveAgentSubtree(paths, agentId);
+			emitZoneEvent(paths, makeEvent(agent, "status", { text: `archived ${agentId}` }));
+			ctx.ui.notify(`Archived ${agentId}.`, "success");
+		},
+	});
+
+	pi.registerCommand("subagent-unarchive", {
+		description: "Restore an archived subagent subtree",
+		handler: async (args, ctx) => {
+			const agentId = args.trim();
+			if (!agentId) {
+				ctx.ui.notify("Usage: /subagent-unarchive <agent-id>", "warning");
+				return;
+			}
+			const { agent, paths } = requireState();
+			const target = getAgentMeta(paths, agentId);
+			if (!target) {
+				ctx.ui.notify(`Unknown agent: ${agentId}`, "error");
+				return;
+			}
+			unarchiveAgentSubtree(paths, agentId);
+			emitZoneEvent(paths, makeEvent(agent, "status", { text: `unarchived ${agentId}` }));
+			ctx.ui.notify(`Unarchived ${agentId}.`, "success");
+		},
+	});
+
 	pi.registerTool({
 		name: "spawn_subagent",
 		label: "Spawn Subagent",
@@ -490,6 +618,71 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 					isError: true,
 				};
 			}
+		},
+	});
+
+	pi.registerTool({
+		name: "message_subagent",
+		label: "Message Subagent",
+		description: "Send a new user message to a persistent subagent conversation and resume it in place.",
+		promptSnippet: "Send a normal new user turn to an existing persistent subagent conversation.",
+		promptGuidelines: [
+			"Use this tool when continuing an existing persistent agent rather than spawning a brand-new child.",
+			"Do not use this on archived agents.",
+		],
+		parameters: Type.Object({
+			agentId: Type.String({ description: "The target persistent subagent ID" }),
+			message: Type.String({ description: "The next user message for that persistent subagent" }),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const { agent, paths } = requireState();
+			try {
+				return await resumeAgentWithMessage(ctx, paths, agent, params.agentId, params.message, pi.getThinkingLevel());
+			} catch (error) {
+				return {
+					content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+					details: { ok: false },
+					isError: true,
+				};
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "archive_subagent",
+		label: "Archive Subagent",
+		description: "Archive a completed subagent subtree so it is hidden by default.",
+		promptSnippet: "Archive a completed subagent subtree when you want to prune tree clutter without deleting it.",
+		parameters: Type.Object({
+			agentId: Type.String({ description: "The root agent ID of the subtree to archive" }),
+		}),
+		async execute(_toolCallId, params) {
+			const { paths } = requireState();
+			const target = getAgentMeta(paths, params.agentId);
+			if (!target) {
+				return { content: [{ type: "text", text: `Unknown agent: ${params.agentId}` }], details: { ok: false }, isError: true };
+			}
+			archiveAgentSubtree(paths, params.agentId);
+			return { content: [{ type: "text", text: `Archived ${params.agentId}.` }], details: { ok: true } };
+		},
+	});
+
+	pi.registerTool({
+		name: "unarchive_subagent",
+		label: "Unarchive Subagent",
+		description: "Restore an archived subagent subtree so it is visible and messageable again.",
+		promptSnippet: "Restore an archived subagent subtree.",
+		parameters: Type.Object({
+			agentId: Type.String({ description: "The root agent ID of the subtree to unarchive" }),
+		}),
+		async execute(_toolCallId, params) {
+			const { paths } = requireState();
+			const target = getAgentMeta(paths, params.agentId);
+			if (!target) {
+				return { content: [{ type: "text", text: `Unknown agent: ${params.agentId}` }], details: { ok: false }, isError: true };
+			}
+			unarchiveAgentSubtree(paths, params.agentId);
+			return { content: [{ type: "text", text: `Unarchived ${params.agentId}.` }], details: { ok: true } };
 		},
 	});
 

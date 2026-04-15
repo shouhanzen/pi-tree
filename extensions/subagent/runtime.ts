@@ -34,6 +34,8 @@ export interface AgentMeta {
 	createdAt: string;
 	pid?: number;
 	alive: boolean;
+	archived?: boolean;
+	archivedAt?: string;
 	lastStatus?: string;
 	lastStatusAt?: string;
 	isRoot: boolean;
@@ -104,6 +106,10 @@ function readJson<T>(filePath: string, fallback: T): T {
 function writeJson(filePath: string, value: unknown): void {
 	mkdirp(path.dirname(filePath));
 	fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+function nowIso(): string {
+	return new Date().toISOString();
 }
 
 export function appendJsonl(filePath: string, value: unknown): void {
@@ -215,11 +221,12 @@ export function loadOrCreateCurrentAgent(cwd: string): { paths: RuntimePaths; ag
 			parentZoneId: process.env.PI_SUBAGENT_PARENT_ZONE_ID || undefined,
 			seedVisibleZoneIds: parseJsonStringArray(process.env.PI_SUBAGENT_SEED_VISIBLE_ZONES) ?? [],
 			cwd,
-			createdAt: new Date().toISOString(),
+			createdAt: nowIso(),
 			pid: process.pid,
 			alive: true,
+			archived: false,
 			lastStatus: "alive",
-			lastStatusAt: new Date().toISOString(),
+			lastStatusAt: nowIso(),
 			isRoot: false,
 		};
 		saveAgentMeta(paths, fallback);
@@ -235,7 +242,7 @@ export function loadOrCreateCurrentAgent(cwd: string): { paths: RuntimePaths; ag
 	const rootMetaPath = path.join(paths.rootDir, "root-agent.json");
 	const existingRoot = readJson<AgentMeta | null>(rootMetaPath, null);
 	if (existingRoot) {
-		const refreshed = { ...existingRoot, pid: process.pid, alive: true, cwd };
+		const refreshed = { ...existingRoot, pid: process.pid, alive: true, archived: false, cwd };
 		saveAgentMeta(paths, refreshed);
 		writeJson(rootMetaPath, refreshed);
 		return { paths, agent: refreshed };
@@ -247,11 +254,12 @@ export function loadOrCreateCurrentAgent(cwd: string): { paths: RuntimePaths; ag
 		zoneId: "zone-root-orca",
 		seedVisibleZoneIds: ["zone-root-orca"],
 		cwd,
-		createdAt: new Date().toISOString(),
+		createdAt: nowIso(),
 		pid: process.pid,
 		alive: true,
+		archived: false,
 		lastStatus: "alive",
-		lastStatusAt: new Date().toISOString(),
+		lastStatusAt: nowIso(),
 		isRoot: true,
 	};
 	saveAgentMeta(paths, rootAgent);
@@ -376,6 +384,8 @@ export function syncVisibleEvents(paths: RuntimePaths, agent: AgentMeta): HeardR
 				}
 				if (event.kind === "status") {
 					emittingMeta.alive = true;
+					emittingMeta.archived = false;
+					emittingMeta.archivedAt = undefined;
 					emittingMeta.lastStatus = String(event.payload.text ?? emittingMeta.lastStatus ?? "alive");
 					emittingMeta.lastStatusAt = event.timestamp;
 					saveAgentMeta(paths, emittingMeta);
@@ -396,10 +406,38 @@ export function markAgentAlive(paths: RuntimePaths, agentId: string, alive: bool
 	const meta = getAgentMeta(paths, agentId);
 	if (!meta) return;
 	meta.alive = alive;
+	meta.archived = false;
+	meta.archivedAt = undefined;
 	meta.pid = alive ? process.pid : meta.pid;
 	meta.lastStatus = status ?? (alive ? "alive" : meta.lastStatus ?? "stopped");
-	meta.lastStatusAt = new Date().toISOString();
+	meta.lastStatusAt = nowIso();
 	saveAgentMeta(paths, meta);
+}
+
+export function archiveAgentSubtree(paths: RuntimePaths, rootAgentId: string): AgentMeta[] {
+	const changed: AgentMeta[] = [];
+	for (const agentId of getDescendantAgentIds(paths, rootAgentId)) {
+		const meta = getAgentMeta(paths, agentId);
+		if (!meta) continue;
+		meta.archived = true;
+		meta.archivedAt = nowIso();
+		saveAgentMeta(paths, meta);
+		changed.push(meta);
+	}
+	return changed;
+}
+
+export function unarchiveAgentSubtree(paths: RuntimePaths, rootAgentId: string): AgentMeta[] {
+	const changed: AgentMeta[] = [];
+	for (const agentId of getDescendantAgentIds(paths, rootAgentId)) {
+		const meta = getAgentMeta(paths, agentId);
+		if (!meta) continue;
+		meta.archived = false;
+		meta.archivedAt = undefined;
+		saveAgentMeta(paths, meta);
+		changed.push(meta);
+	}
+	return changed;
 }
 
 export function summarizeEventForProjection(event: ZoneEvent): string {
@@ -469,7 +507,7 @@ export function buildZoneSpans(paths: RuntimePaths, agent: AgentMeta): ZoneSpan[
 			return !zone?.parentZoneId || !visibleSet.has(zone.parentZoneId);
 		})
 		.map((zoneId) => buildSpan(zoneId))
-		.filter((span) => span.records.length > 0 || span.children.length > 0);
+		.filter((span) => (span.ownerAgent?.archived ? false : span.records.length > 0 || span.children.length > 0));
 }
 
 export function renderProjectionMarkdown(paths: RuntimePaths, agent: AgentMeta): string {
@@ -489,7 +527,7 @@ function renderZoneSpan(lines: string[], span: ZoneSpan): void {
 	const depth = Math.min(6, 2 + span.depth);
 	const hashes = "#".repeat(depth);
 	const ownerLabel = span.ownerAgent ? `${span.ownerAgent.name} (${span.ownerAgent.agentId})` : "unknown-agent";
-	const state = span.isAlive ? "alive" : "dead";
+	const state = span.ownerAgent?.archived ? "archived" : span.isAlive ? "alive" : span.ownerAgent?.lastStatus ?? "dead";
 	lines.push(`${hashes} Zone span ${span.zoneId}`);
 	lines.push(`Header: agent=${ownerLabel} state=${state}`);
 	if (span.zone?.parentZoneId) lines.push(`Parent zone: ${span.zone.parentZoneId}`);
@@ -502,25 +540,10 @@ function renderZoneSpan(lines: string[], span: ZoneSpan): void {
 		lines.push("");
 	}
 	if (span.children.length > 0) {
-		if (span.isAlive) {
-			lines.push("Nested live spans:");
-			lines.push("");
-			for (const child of span.children) renderZoneSpan(lines, child);
-		} else {
-			lines.push("Nested spans dissolved into historical transcript:");
-			lines.push("");
-			for (const child of span.children) renderDissolvedZoneSpan(lines, child);
-		}
+		lines.push(span.isAlive ? "Nested spans:" : "Nested historical spans:");
+		lines.push("");
+		for (const child of span.children) renderZoneSpan(lines, child);
 	}
-}
-
-function renderDissolvedZoneSpan(lines: string[], span: ZoneSpan): void {
-	const ownerLabel = span.ownerAgent ? `${span.ownerAgent.name} (${span.ownerAgent.agentId})` : "unknown-agent";
-	lines.push(`- dead zone header ${span.zoneId} agent=${ownerLabel} state=${span.isAlive ? "alive" : "dead"}`);
-	for (const record of span.records) {
-		lines.push(`  - ${record.event.emittingAgentId}: ${summarizeEventForProjection(record.event)}`);
-	}
-	for (const child of span.children) renderDissolvedZoneSpan(lines, child);
 }
 
 function computeZoneDepth(zoneId: string, zoneMap: Map<string, ZoneMeta>): number {
@@ -598,38 +621,13 @@ export function getPiInvocation(args: string[]): { command: string; args: string
 	return { command: "pi", args };
 }
 
-export function spawnChildProcess(paths: RuntimePaths, parentAgent: AgentMeta, options: SpawnOptions): AgentMeta {
-	const childAgentId = randomId("agent");
-	const childZoneId = randomId("zone");
-	const childName = options.name?.trim() || childAgentId;
-	const childMeta: AgentMeta = {
-		agentId: childAgentId,
-		name: childName,
-		zoneId: childZoneId,
-		parentAgentId: parentAgent.agentId,
-		parentZoneId: parentAgent.zoneId,
-		seedVisibleZoneIds: Array.from(new Set([...buildVisibleZoneIds(paths, parentAgent), childZoneId])),
-		cwd: parentAgent.cwd,
-		createdAt: new Date().toISOString(),
-		alive: true,
-		lastStatus: "alive",
-		lastStatusAt: new Date().toISOString(),
-		isRoot: false,
-	};
-	saveAgentMeta(paths, childMeta);
-	saveZoneMeta(paths, {
-		zoneId: childZoneId,
-		ownerAgentId: childAgentId,
-		parentZoneId: parentAgent.zoneId,
-		createdAt: childMeta.createdAt,
-	});
-
-	const snapshotPath = writeSnapshot(paths, childAgentId, options.snapshotMarkdown);
+function launchAgentProcess(paths: RuntimePaths, meta: AgentMeta, options: SpawnOptions): AgentMeta {
+	const snapshotPath = writeSnapshot(paths, meta.agentId, options.snapshotMarkdown);
 	const appendSystemPrompt =
 		options.appendSystemPrompt ||
 		[
-			`You are subagent ${childName} (${childAgentId}).`,
-			`Your root zone is ${childZoneId}.`,
+			`You are subagent ${meta.name} (${meta.agentId}).`,
+			`Your root zone is ${meta.zoneId}.`,
 			`You may use recursive subagents when helpful.`,
 			`You do not return a special handoff. Do the work and stop when done.`,
 		].join("\n");
@@ -642,23 +640,65 @@ export function spawnChildProcess(paths: RuntimePaths, parentAgent: AgentMeta, o
 	const invocation = getPiInvocation(args);
 	const childEnv = {
 		...process.env,
-		PI_SUBAGENT_AGENT_ID: childAgentId,
-		PI_SUBAGENT_AGENT_NAME: childName,
-		PI_SUBAGENT_ZONE_ID: childZoneId,
-		PI_SUBAGENT_PARENT_AGENT_ID: parentAgent.agentId,
-		PI_SUBAGENT_PARENT_ZONE_ID: parentAgent.zoneId,
-		PI_SUBAGENT_SEED_VISIBLE_ZONES: JSON.stringify(childMeta.seedVisibleZoneIds),
+		PI_SUBAGENT_AGENT_ID: meta.agentId,
+		PI_SUBAGENT_AGENT_NAME: meta.name,
+		PI_SUBAGENT_ZONE_ID: meta.zoneId,
+		PI_SUBAGENT_PARENT_AGENT_ID: meta.parentAgentId,
+		PI_SUBAGENT_PARENT_ZONE_ID: meta.parentZoneId,
+		PI_SUBAGENT_SEED_VISIBLE_ZONES: JSON.stringify(meta.seedVisibleZoneIds),
 	};
 	const child = spawn(invocation.command, invocation.args, {
-		cwd: parentAgent.cwd,
+		cwd: meta.cwd,
 		env: childEnv,
 		stdio: "ignore",
 		detached: true,
 	});
 	child.unref();
-	childMeta.pid = child.pid;
+	meta.pid = child.pid;
+	meta.alive = true;
+	meta.archived = false;
+	meta.archivedAt = undefined;
+	meta.lastStatus = "alive";
+	meta.lastStatusAt = nowIso();
+	saveAgentMeta(paths, meta);
+	return meta;
+}
+
+export function spawnChildProcess(paths: RuntimePaths, parentAgent: AgentMeta, options: SpawnOptions): AgentMeta {
+	const childAgentId = randomId("agent");
+	const childZoneId = randomId("zone");
+	const childName = options.name?.trim() || childAgentId;
+	const childMeta: AgentMeta = {
+		agentId: childAgentId,
+		name: childName,
+		zoneId: childZoneId,
+		parentAgentId: parentAgent.agentId,
+		parentZoneId: parentAgent.zoneId,
+		seedVisibleZoneIds: Array.from(new Set([...buildVisibleZoneIds(paths, parentAgent), childZoneId])),
+		cwd: parentAgent.cwd,
+		createdAt: nowIso(),
+		alive: true,
+		archived: false,
+		lastStatus: "alive",
+		lastStatusAt: nowIso(),
+		isRoot: false,
+	};
 	saveAgentMeta(paths, childMeta);
-	return childMeta;
+	saveZoneMeta(paths, {
+		zoneId: childZoneId,
+		ownerAgentId: childAgentId,
+		parentZoneId: parentAgent.zoneId,
+		createdAt: childMeta.createdAt,
+	});
+	return launchAgentProcess(paths, childMeta, options);
+}
+
+export function resumeAgentProcess(paths: RuntimePaths, agentId: string, options: SpawnOptions): AgentMeta {
+	const meta = getAgentMeta(paths, agentId);
+	if (!meta) throw new Error(`Unknown agent: ${agentId}`);
+	if (meta.archived) throw new Error(`Archived agent cannot receive messages: ${agentId}`);
+	if (meta.alive) throw new Error(`Agent is already running: ${agentId}`);
+	return launchAgentProcess(paths, meta, options);
 }
 
 export function appendAgentTerminalEvent(paths: RuntimePaths, agentId: string, status: string): AgentMeta | null {
