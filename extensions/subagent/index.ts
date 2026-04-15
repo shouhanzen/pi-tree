@@ -2,7 +2,7 @@ import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import { complete } from "@mariozechner/pi-ai";
 import { convertToLlm, serializeConversation, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { fileURLToPath } from "node:url";
-import { matchesKey, visibleWidth, type Focusable, type Theme } from "@mariozechner/pi-tui";
+import { matchesKey, truncateToWidth, wrapTextWithAnsi, type Focusable, type Theme } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import {
 	EXTENSION_NAME,
@@ -16,10 +16,12 @@ import {
 	extractTextFromContent,
 	getAgentMeta,
 	getDescendantAgentIds,
+	getZoneEventPath,
 	isAgentSubtreeAlive,
 	killAgentProcess,
 	loadOrCreateCurrentAgent,
 	markAgentAlive,
+	readJsonl,
 	renderProjectionMarkdown,
 	renderSessionBranchSnapshot,
 	flattenAgentTree,
@@ -27,6 +29,7 @@ import {
 	randomId,
 	refreshAgentLiveness,
 	spawnChildProcess,
+	summarizeEventForProjection,
 	syncVisibleEvents,
 	type RuntimePaths,
 	unarchiveAgentSubtree,
@@ -112,19 +115,101 @@ function formatAgentState(agent: AgentMeta): string {
 	return agent.lastStatus ?? "dead";
 }
 
+function getStateColor(state: string): "success" | "warning" | "dim" {
+	if (state === "alive") return "success";
+	if (state === "archived") return "warning";
+	return "dim";
+}
+
+function makePaneLine(theme: Theme, width: number, text = "", borderLeft = "│", borderRight = "│"): string {
+	return `${theme.fg("border", borderLeft)}${truncateToWidth(text, Math.max(0, width - 2), "…", true)}${theme.fg("border", borderRight)}`;
+}
+
+function wrapPaneText(text: string, width: number): string[] {
+	const innerWidth = Math.max(1, width - 2);
+	return text
+		.split("\n")
+		.flatMap((line) => (line.length === 0 ? [""] : wrapTextWithAnsi(line, innerWidth)));
+}
+
+function buildAgentDetailLines(paths: RuntimePaths, target: AgentMeta): string[] {
+	const zoneEvents = readJsonl<ZoneEvent>(getZoneEventPath(paths, target.zoneId));
+	const recentEvents = zoneEvents.slice(-24);
+	const header = [
+		`Name: ${target.name}`,
+		`Agent: ${target.agentId}`,
+		`Zone: ${target.zoneId}`,
+		`State: ${formatAgentState(target)}`,
+		"",
+		"Recent chat:",
+	];
+	if (recentEvents.length === 0) {
+		header.push("(no events yet)");
+		return header;
+	}
+	for (const event of recentEvents) {
+		header.push(`- ${event.emittingAgentId}: ${summarizeEventForProjection(event)}`);
+	}
+	return header;
+}
+
+export function renderSubagentUiPreview(paths: RuntimePaths, selectedAgentId?: string, showArchived = false, width = 120): string[] {
+	const plainTheme: Theme = {
+		fg: (_token: any, text: string) => text,
+		bg: (_token: any, text: string) => text,
+		bold: (text: string) => text,
+		dim: (text: string) => text,
+		italic: (text: string) => text,
+		underline: (text: string) => text,
+		strikethrough: (text: string) => text,
+	} as Theme;
+	const nodes = flattenAgentTree(buildAgentTree(paths, showArchived));
+	const selected = nodes.find((node) => node.agent.agentId === selectedAgentId) ?? nodes[0];
+	const overlay = new AgentTreeOverlay(
+		plainTheme,
+		(includeArchived) => buildAgentTree(paths, includeArchived),
+		(agentId) => {
+			const target = getAgentMeta(paths, agentId);
+			if (!target) return `Unknown agent: ${agentId}`;
+			const chatLines = buildAgentDetailLines(paths, target);
+			const projection = renderProjectionMarkdown(paths, target);
+			return projection.trim() ? [...chatLines, "", "Routed context:", projection].join("\n") : chatLines.join("\n");
+		},
+		() => "",
+		() => "",
+		() => {},
+	);
+		(overlay as any).showArchived = showArchived;
+		(overlay as any).selectedIndex = Math.max(0, nodes.findIndex((node) => node.agent.agentId === selected?.agent.agentId));
+	return overlay.render(width);
+}
+
 class AgentTreeOverlay implements Focusable {
 	focused = false;
 	private selectedIndex = 0;
 	private showArchived = false;
+	private readonly theme: Theme;
+	private readonly getNodes: (showArchived: boolean) => AgentTreeNode[];
+	private readonly getDetail: (agentId: string) => string;
+	private readonly onArchive: (agentId: string) => string;
+	private readonly onUnarchive: (agentId: string) => string;
+	private readonly done: () => void;
 
 	constructor(
-		private readonly theme: Theme,
-		private readonly getNodes: (showArchived: boolean) => AgentTreeNode[],
-		private readonly getDetail: (agentId: string) => string,
-		private readonly onArchive: (agentId: string) => string,
-		private readonly onUnarchive: (agentId: string) => string,
-		private readonly done: () => void,
-	) {}
+		theme: Theme,
+		getNodes: (showArchived: boolean) => AgentTreeNode[],
+		getDetail: (agentId: string) => string,
+		onArchive: (agentId: string) => string,
+		onUnarchive: (agentId: string) => string,
+		done: () => void,
+	) {
+		this.theme = theme;
+		this.getNodes = getNodes;
+		this.getDetail = getDetail;
+		this.onArchive = onArchive;
+		this.onUnarchive = onUnarchive;
+		this.done = done;
+	}
 
 	private getFlatNodes(): AgentTreeNode[] {
 		return flattenAgentTree(this.getNodes(this.showArchived));
@@ -167,52 +252,61 @@ class AgentTreeOverlay implements Focusable {
 
 	render(width: number): string[] {
 		const nodes = this.getFlatNodes();
+		this.selectedIndex = Math.max(0, Math.min(this.selectedIndex, Math.max(0, nodes.length - 1)));
 		const selected = nodes[this.selectedIndex] ?? nodes[0];
-		const leftWidth = Math.max(28, Math.floor(width * 0.34));
-		const rightWidth = Math.max(40, width - leftWidth - 3);
+		const leftWidth = Math.max(30, Math.floor(width * 0.33));
+		const rightWidth = Math.max(46, width - leftWidth - 1);
 		const leftLines = this.renderTree(leftWidth, nodes);
 		const rightLines = this.renderDetail(rightWidth, selected?.agent.agentId);
 		const maxLines = Math.max(leftLines.length, rightLines.length);
 		const lines: string[] = [];
 		for (let i = 0; i < maxLines; i++) {
-			const left = leftLines[i] ?? " ".repeat(leftWidth);
-			const right = rightLines[i] ?? " ".repeat(rightWidth);
-			lines.push(`${left} ${this.theme.fg("border", "│")} ${right}`);
+			const left = leftLines[i] ?? makePaneLine(this.theme, leftWidth);
+			const right = rightLines[i] ?? makePaneLine(this.theme, rightWidth);
+			lines.push(`${left}${right}`);
 		}
 		return lines;
 	}
 
 	private renderTree(width: number, nodes: AgentTreeNode[]): string[] {
-		const pad = (s: string) => {
-			const len = visibleWidth(s);
-			return s + " ".repeat(Math.max(0, width - len));
-		};
-		const lines = [pad(this.theme.fg("accent", ` Agents ${this.showArchived ? "(archived shown)" : ""}`)), pad("")];
+		const lines: string[] = [];
+		lines.push(this.theme.fg("border", `╭${"─".repeat(width - 2)}╮`));
+		lines.push(makePaneLine(this.theme, width, this.theme.fg("accent", ` Subagents ${this.showArchived ? "• archived shown" : ""}`)));
+		lines.push(makePaneLine(this.theme, width, this.theme.fg("dim", `${nodes.length} visible node(s)`)));
+		lines.push(makePaneLine(this.theme, width));
 		for (let i = 0; i < nodes.length; i++) {
 			const node = nodes[i]!;
-			const prefix = i === this.selectedIndex ? this.theme.fg("accent", "▶ ") : "  ";
-			const indent = "  ".repeat(node.depth);
 			const state = formatAgentState(node.agent);
-			const stateColor = state === "alive" ? "success" : state === "archived" ? "warning" : "dim";
+			const indent = "  ".repeat(node.depth);
+			const marker = i === this.selectedIndex ? this.theme.fg("accent", "▶") : this.theme.fg("dim", "•");
 			const idShort = node.agent.agentId.slice(0, 8);
-			const label = `${indent}${node.agent.name} · ${idShort}`;
-			const row = `${prefix}${label} ${this.theme.fg(stateColor as any, `[${state}]`)}`;
-			lines.push(pad(row.slice(0, Math.max(row.length, width))));
+			const row = `${marker} ${indent}${node.agent.name} · ${idShort} ${this.theme.fg(getStateColor(state), `[${state}]`)}`;
+			lines.push(makePaneLine(this.theme, width, row));
 		}
-		lines.push(pad(""));
-		lines.push(pad(this.theme.fg("dim", "↑↓ select  a archive  u restore  f archived  esc close")));
-		return lines.map((line) => line.slice(0, width));
+		if (nodes.length === 0) {
+			lines.push(makePaneLine(this.theme, width, this.theme.fg("dim", "No agents yet.")));
+		}
+		lines.push(makePaneLine(this.theme, width));
+		lines.push(makePaneLine(this.theme, width, this.theme.fg("dim", "↑↓/j/k select  a archive  u restore  f toggle archived  esc close")));
+		lines.push(this.theme.fg("border", `╰${"─".repeat(width - 2)}╯`));
+		return lines;
 	}
 
 	private renderDetail(width: number, agentId?: string): string[] {
-		const pad = (s: string) => {
-			const len = visibleWidth(s);
-			return s + " ".repeat(Math.max(0, width - len));
-		};
-		if (!agentId) return [pad(this.theme.fg("dim", "No agent selected."))];
-		const detail = this.getDetail(agentId).split("\n");
-		const title = pad(this.theme.fg("accent", ` Selected agent`));
-		return [title, pad(""), ...detail.map((line) => pad(line).slice(0, width))];
+		const lines: string[] = [];
+		lines.push(this.theme.fg("border", `╭${"─".repeat(width - 2)}╮`));
+		lines.push(makePaneLine(this.theme, width, this.theme.fg("accent", " Selected agent chat")));
+		lines.push(makePaneLine(this.theme, width));
+		if (!agentId) {
+			lines.push(makePaneLine(this.theme, width, this.theme.fg("dim", "No agent selected.")));
+			lines.push(this.theme.fg("border", `╰${"─".repeat(width - 2)}╯`));
+			return lines;
+		}
+		for (const line of wrapPaneText(this.getDetail(agentId), width)) {
+			lines.push(makePaneLine(this.theme, width, line));
+		}
+		lines.push(this.theme.fg("border", `╰${"─".repeat(width - 2)}╯`));
+		return lines;
 	}
 
 	invalidate(): void {}
@@ -671,14 +765,10 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 				const target = getAgentMeta(paths, agentId);
 				if (!target) return `Unknown agent: ${agentId}`;
 				refreshForkzoneRuntime(paths, target);
-				return [
-					`Name: ${target.name}`,
-					`Agent: ${target.agentId}`,
-					`Zone: ${target.zoneId}`,
-					`State: ${formatAgentState(target)}`,
-					"",
-					renderProjectionMarkdown(paths, target) || "No transcript yet.",
-				].join("\n");
+				const chatLines = buildAgentDetailLines(paths, target);
+				const projection = renderProjectionMarkdown(paths, target);
+				if (!projection.trim()) return chatLines.join("\n");
+				return [...chatLines, "", "Routed context:", projection].join("\n");
 			};
 			await ctx.ui.custom((_tui, theme, _kb, done) => {
 				return new AgentTreeOverlay(
@@ -801,44 +891,6 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 					isError: true,
 				};
 			}
-		},
-	});
-
-	pi.registerTool({
-		name: "archive_subagent",
-		label: "Archive Subagent",
-		description: "Archive a completed subagent subtree so it is hidden by default.",
-		promptSnippet: "Archive a completed subagent subtree when you want to prune tree clutter without deleting it.",
-		parameters: Type.Object({
-			agentId: Type.String({ description: "The root agent ID of the subtree to archive" }),
-		}),
-		async execute(_toolCallId, params) {
-			const { paths } = requireState();
-			const target = getAgentMeta(paths, params.agentId);
-			if (!target) {
-				return { content: [{ type: "text", text: `Unknown agent: ${params.agentId}` }], details: { ok: false }, isError: true };
-			}
-			archiveAgentSubtree(paths, params.agentId);
-			return { content: [{ type: "text", text: `Archived ${params.agentId}.` }], details: { ok: true } };
-		},
-	});
-
-	pi.registerTool({
-		name: "unarchive_subagent",
-		label: "Unarchive Subagent",
-		description: "Restore an archived subagent subtree so it is visible and messageable again.",
-		promptSnippet: "Restore an archived subagent subtree.",
-		parameters: Type.Object({
-			agentId: Type.String({ description: "The root agent ID of the subtree to unarchive" }),
-		}),
-		async execute(_toolCallId, params) {
-			const { paths } = requireState();
-			const target = getAgentMeta(paths, params.agentId);
-			if (!target) {
-				return { content: [{ type: "text", text: `Unknown agent: ${params.agentId}` }], details: { ok: false }, isError: true };
-			}
-			unarchiveAgentSubtree(paths, params.agentId);
-			return { content: [{ type: "text", text: `Unarchived ${params.agentId}.` }], details: { ok: true } };
 		},
 	});
 

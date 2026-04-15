@@ -42,12 +42,16 @@ Important subdirectories:
 
 ## Tools
 
+Model-facing tools:
 - `spawn_subagent`
 - `kill_subagent`
 - `join_subagent`
 - `message_subagent`
-- `archive_subagent`
-- `unarchive_subagent`
+
+User/session-management commands:
+- `/subagent-archive`
+- `/subagent-unarchive`
+- `/subagent-ui`
 
 ## Current limitations
 
