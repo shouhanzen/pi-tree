@@ -44,4 +44,5 @@ Sandbox/runtime files are ignored and written under:
 3. Use `join_subagent` when you need a synchronization barrier
 4. Use `message_subagent` to continue an existing persistent agent in place
 5. Use `archive_subagent` / `unarchive_subagent` to manage tree clutter
-6. Inspect `PLAN.md`, `PLAN_JOIN.md`, and `PLAN_PERSISTENT_AGENTS.md` when iterating on the design
+6. Try `/subagent-ui` for the experimental tree/chat overlay preview
+7. Inspect `PLAN.md`, `PLAN_JOIN.md`, and `PLAN_PERSISTENT_AGENTS.md` when iterating on the design

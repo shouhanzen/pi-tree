@@ -370,7 +370,7 @@ Still incomplete / future work:
 1. Further improve span projection so dead-zone dissipation and append tails are even closer to the ideal model
 2. Harden runtime liveness/process cleanup further, especially around PID reuse and interrupted sessions
 3. Improve the quality and structure of custom compaction summaries
-4. Build the three-pane TUI described above
+4. Replace the current experimental `/subagent-ui` overlay with the proper persistent-agent tree/chat TUI
 5. Tool/mutation permissions per agent class
-6. Evaluate the persistent/messageable-agent model and how it changes zone lifecycle semantics
+6. Continue refining the persistent/messageable-agent model and how it changes zone lifecycle semantics
 7. Guardrails if recursive sibling cross-talk gets too noisy in practice

@@ -76,6 +76,12 @@ export interface ZoneSpan {
 	children: ZoneSpan[];
 }
 
+export interface AgentTreeNode {
+	agent: AgentMeta;
+	children: AgentTreeNode[];
+	depth: number;
+}
+
 export interface SpawnOptions {
 	name?: string;
 	task: string;
@@ -699,6 +705,35 @@ export function resumeAgentProcess(paths: RuntimePaths, agentId: string, options
 	if (meta.archived) throw new Error(`Archived agent cannot receive messages: ${agentId}`);
 	if (meta.alive) throw new Error(`Agent is already running: ${agentId}`);
 	return launchAgentProcess(paths, meta, options);
+}
+
+export function buildAgentTree(paths: RuntimePaths, includeArchived = false): AgentTreeNode[] {
+	const metas = listAgentMetas(paths)
+		.filter((meta) => includeArchived || !meta.archived)
+		.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+	const byParent = new Map<string, AgentMeta[]>();
+	for (const meta of metas) {
+		const parentId = meta.parentAgentId ?? "<root>";
+		const current = byParent.get(parentId) ?? [];
+		current.push(meta);
+		byParent.set(parentId, current);
+	}
+	const buildNode = (agent: AgentMeta, depth: number): AgentTreeNode => ({
+		agent,
+		depth,
+		children: (byParent.get(agent.agentId) ?? []).map((child) => buildNode(child, depth + 1)),
+	});
+	return (byParent.get("<root>") ?? []).map((root) => buildNode(root, 0));
+}
+
+export function flattenAgentTree(nodes: AgentTreeNode[]): AgentTreeNode[] {
+	const flat: AgentTreeNode[] = [];
+	const visit = (node: AgentTreeNode) => {
+		flat.push(node);
+		for (const child of node.children) visit(child);
+	};
+	for (const node of nodes) visit(node);
+	return flat;
 }
 
 export function appendAgentTerminalEvent(paths: RuntimePaths, agentId: string, status: string): AgentMeta | null {

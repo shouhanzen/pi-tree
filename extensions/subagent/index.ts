@@ -2,12 +2,15 @@ import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import { complete } from "@mariozechner/pi-ai";
 import { convertToLlm, serializeConversation, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { fileURLToPath } from "node:url";
+import { matchesKey, visibleWidth, type Focusable, type Theme } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import {
 	EXTENSION_NAME,
 	type AgentMeta,
 	type ZoneEvent,
 	archiveAgentSubtree,
+	type AgentTreeNode,
+	buildAgentTree,
 	buildVisibleZoneIds,
 	emitZoneEvent,
 	extractTextFromContent,
@@ -19,6 +22,7 @@ import {
 	markAgentAlive,
 	renderProjectionMarkdown,
 	renderSessionBranchSnapshot,
+	flattenAgentTree,
 	resumeAgentProcess,
 	randomId,
 	refreshAgentLiveness,
@@ -100,6 +104,118 @@ function makeEvent(agent: AgentMeta, kind: ZoneEvent["kind"], payload: Record<st
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function formatAgentState(agent: AgentMeta): string {
+	if (agent.archived) return "archived";
+	if (agent.alive) return "alive";
+	return agent.lastStatus ?? "dead";
+}
+
+class AgentTreeOverlay implements Focusable {
+	focused = false;
+	private selectedIndex = 0;
+	private showArchived = false;
+
+	constructor(
+		private readonly theme: Theme,
+		private readonly getNodes: (showArchived: boolean) => AgentTreeNode[],
+		private readonly getDetail: (agentId: string) => string,
+		private readonly onArchive: (agentId: string) => string,
+		private readonly onUnarchive: (agentId: string) => string,
+		private readonly done: () => void,
+	) {}
+
+	private getFlatNodes(): AgentTreeNode[] {
+		return flattenAgentTree(this.getNodes(this.showArchived));
+	}
+
+	handleInput(data: string): void {
+		const nodes = this.getFlatNodes();
+		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
+			this.done();
+			return;
+		}
+		if (matchesKey(data, "down") || matchesKey(data, "j")) {
+			this.selectedIndex = Math.min(nodes.length - 1, this.selectedIndex + 1);
+			return;
+		}
+		if (matchesKey(data, "up") || matchesKey(data, "k")) {
+			this.selectedIndex = Math.max(0, this.selectedIndex - 1);
+			return;
+		}
+		if (matchesKey(data, "a")) {
+			const node = nodes[this.selectedIndex];
+			if (node && !node.agent.archived && !node.agent.alive && !node.agent.isRoot) {
+				this.onArchive(node.agent.agentId);
+			}
+			return;
+		}
+		if (matchesKey(data, "u")) {
+			const node = nodes[this.selectedIndex];
+			if (node && node.agent.archived) {
+				this.onUnarchive(node.agent.agentId);
+			}
+			return;
+		}
+		if (matchesKey(data, "f")) {
+			this.showArchived = !this.showArchived;
+			this.selectedIndex = 0;
+			return;
+		}
+	}
+
+	render(width: number): string[] {
+		const nodes = this.getFlatNodes();
+		const selected = nodes[this.selectedIndex] ?? nodes[0];
+		const leftWidth = Math.max(28, Math.floor(width * 0.34));
+		const rightWidth = Math.max(40, width - leftWidth - 3);
+		const leftLines = this.renderTree(leftWidth, nodes);
+		const rightLines = this.renderDetail(rightWidth, selected?.agent.agentId);
+		const maxLines = Math.max(leftLines.length, rightLines.length);
+		const lines: string[] = [];
+		for (let i = 0; i < maxLines; i++) {
+			const left = leftLines[i] ?? " ".repeat(leftWidth);
+			const right = rightLines[i] ?? " ".repeat(rightWidth);
+			lines.push(`${left} ${this.theme.fg("border", "│")} ${right}`);
+		}
+		return lines;
+	}
+
+	private renderTree(width: number, nodes: AgentTreeNode[]): string[] {
+		const pad = (s: string) => {
+			const len = visibleWidth(s);
+			return s + " ".repeat(Math.max(0, width - len));
+		};
+		const lines = [pad(this.theme.fg("accent", ` Agents ${this.showArchived ? "(archived shown)" : ""}`)), pad("")];
+		for (let i = 0; i < nodes.length; i++) {
+			const node = nodes[i]!;
+			const prefix = i === this.selectedIndex ? this.theme.fg("accent", "▶ ") : "  ";
+			const indent = "  ".repeat(node.depth);
+			const state = formatAgentState(node.agent);
+			const stateColor = state === "alive" ? "success" : state === "archived" ? "warning" : "dim";
+			const idShort = node.agent.agentId.slice(0, 8);
+			const label = `${indent}${node.agent.name} · ${idShort}`;
+			const row = `${prefix}${label} ${this.theme.fg(stateColor as any, `[${state}]`)}`;
+			lines.push(pad(row.slice(0, Math.max(row.length, width))));
+		}
+		lines.push(pad(""));
+		lines.push(pad(this.theme.fg("dim", "↑↓ select  a archive  u restore  f archived  esc close")));
+		return lines.map((line) => line.slice(0, width));
+	}
+
+	private renderDetail(width: number, agentId?: string): string[] {
+		const pad = (s: string) => {
+			const len = visibleWidth(s);
+			return s + " ".repeat(Math.max(0, width - len));
+		};
+		if (!agentId) return [pad(this.theme.fg("dim", "No agent selected."))];
+		const detail = this.getDetail(agentId).split("\n");
+		const title = pad(this.theme.fg("accent", ` Selected agent`));
+		return [title, pad(""), ...detail.map((line) => pad(line).slice(0, width))];
+	}
+
+	invalidate(): void {}
 }
 
 function updateStatus(ctx: ExtensionContext, _paths: RuntimePaths, agent: AgentMeta): void {
@@ -540,6 +656,46 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			unarchiveAgentSubtree(paths, agentId);
 			emitZoneEvent(paths, makeEvent(agent, "status", { text: `unarchived ${agentId}` }));
 			ctx.ui.notify(`Unarchived ${agentId}.`, "success");
+		},
+	});
+
+	pi.registerCommand("subagent-ui", {
+		description: "Open an experimental two-pane agent tree + selected chat browser",
+		handler: async (_args, ctx) => {
+			const { agent, paths } = requireState();
+			const getNodes = (showArchived: boolean) => {
+				refreshForkzoneRuntime(paths, agent);
+				return buildAgentTree(paths, showArchived);
+			};
+			const getDetail = (agentId: string) => {
+				const target = getAgentMeta(paths, agentId);
+				if (!target) return `Unknown agent: ${agentId}`;
+				refreshForkzoneRuntime(paths, target);
+				return [
+					`Name: ${target.name}`,
+					`Agent: ${target.agentId}`,
+					`Zone: ${target.zoneId}`,
+					`State: ${formatAgentState(target)}`,
+					"",
+					renderProjectionMarkdown(paths, target) || "No transcript yet.",
+				].join("\n");
+			};
+			await ctx.ui.custom((_tui, theme, _kb, done) => {
+				return new AgentTreeOverlay(
+					theme,
+					getNodes,
+					getDetail,
+					(agentId) => {
+						archiveAgentSubtree(paths, agentId);
+						return `Archived ${agentId}.`;
+					},
+					(agentId) => {
+						unarchiveAgentSubtree(paths, agentId);
+						return `Unarchived ${agentId}.`;
+					},
+					() => done(undefined),
+				);
+			}, { overlay: true, overlayOptions: { anchor: "center", width: "90%", maxHeight: "85%" } });
 		},
 	});
 

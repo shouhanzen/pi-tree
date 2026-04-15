@@ -38,6 +38,7 @@ Important subdirectories:
 - `/subagent-message <agent-id> <message>` - send a new user turn to an existing persistent subagent conversation
 - `/subagent-archive <agent-id>` - archive a completed subtree (soft hide)
 - `/subagent-unarchive <agent-id>` - restore an archived subtree
+- `/subagent-ui` - open an experimental two-pane tree/chat browser overlay
 
 ## Tools
 
@@ -57,7 +58,7 @@ Known gaps:
 - custom per-agent compaction exists but still needs refinement
 - runtime liveness cleanup, join, persistence, and archive flows work, but still are not production-hardened
 - routed context is persisted in extension-managed files, not deeply integrated into pi session history
-- UI is intentionally minimal
+- the experimental `/subagent-ui` overlay is an early preview, not the final integrated sidebar/chat UI
 
 ## Suggested next steps
 
