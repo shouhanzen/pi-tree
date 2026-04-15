@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -16,6 +17,7 @@ export type EventKind =
 	| "status";
 
 export interface RuntimePaths {
+	runtimeKey: string;
 	rootDir: string;
 	agentsDir: string;
 	zonesDir: string;
@@ -141,9 +143,15 @@ export function randomId(prefix: string): string {
 	return `${prefix}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-export function getRuntimePaths(cwd: string): RuntimePaths {
-	const rootDir = path.resolve(cwd, ".pi", FORKZONE_DIRNAME);
+export function getRuntimeKey(sessionFile: string | undefined, cwd: string): string {
+	const source = sessionFile && sessionFile.trim().length > 0 ? sessionFile : `cwd:${cwd}`;
+	return createHash("sha1").update(source).digest("hex").slice(0, 12);
+}
+
+export function getRuntimePaths(cwd: string, runtimeKey: string): RuntimePaths {
+	const rootDir = path.resolve(cwd, ".pi", FORKZONE_DIRNAME, "runtimes", runtimeKey);
 	return {
+		runtimeKey,
 		rootDir,
 		agentsDir: path.join(rootDir, "agents"),
 		zonesDir: path.join(rootDir, "zones"),
@@ -152,8 +160,8 @@ export function getRuntimePaths(cwd: string): RuntimePaths {
 	};
 }
 
-export function ensureRuntime(cwd: string): RuntimePaths {
-	const paths = getRuntimePaths(cwd);
+export function ensureRuntime(cwd: string, runtimeKey: string): RuntimePaths {
+	const paths = getRuntimePaths(cwd, runtimeKey);
 	mkdirp(paths.rootDir);
 	mkdirp(paths.agentsDir);
 	mkdirp(paths.zonesDir);
@@ -217,8 +225,9 @@ export function saveZoneMeta(paths: RuntimePaths, meta: ZoneMeta): void {
 	writeJson(getZoneMetaPath(paths, meta.zoneId), meta);
 }
 
-export function loadOrCreateCurrentAgent(cwd: string): { paths: RuntimePaths; agent: AgentMeta } {
-	const paths = ensureRuntime(cwd);
+export function loadOrCreateCurrentAgent(cwd: string, sessionFile?: string): { paths: RuntimePaths; agent: AgentMeta } {
+	const runtimeKey = process.env.PI_SUBAGENT_RUNTIME_KEY || getRuntimeKey(sessionFile ?? process.env.PI_SUBAGENT_SESSION_FILE, cwd);
+	const paths = ensureRuntime(cwd, runtimeKey);
 	const envAgentId = process.env.PI_SUBAGENT_AGENT_ID;
 	if (envAgentId) {
 		const existing = getAgentMeta(paths, envAgentId);
@@ -690,6 +699,7 @@ function launchAgentProcess(paths: RuntimePaths, meta: AgentMeta, options: Spawn
 		PI_SUBAGENT_PARENT_ZONE_ID: meta.parentZoneId,
 		PI_SUBAGENT_SEED_VISIBLE_ZONES: JSON.stringify(meta.seedVisibleZoneIds),
 		PI_SUBAGENT_SESSION_FILE: options.sessionFile,
+		PI_SUBAGENT_RUNTIME_KEY: paths.runtimeKey,
 		...(options.skipFirstUserMessageEvent ? { PI_SUBAGENT_SKIP_FIRST_USER_MESSAGE_EVENT: "1" } : {}),
 	};
 	const child = spawn(invocation.command, invocation.args, {

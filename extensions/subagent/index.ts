@@ -10,6 +10,7 @@ import {
 	convertToLlm,
 	serializeConversation,
 } from "@mariozechner/pi-coding-agent";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { matchesKey, truncateToWidth, wrapTextWithAnsi, type Focusable, type Theme } from "@mariozechner/pi-tui";
@@ -31,6 +32,7 @@ import {
 	killAgentProcess,
 	loadOrCreateCurrentAgent,
 	markAgentAlive,
+	getRuntimeKey,
 	readJsonl,
 	renderProjectionMarkdown,
 	saveAgentMeta,
@@ -220,6 +222,9 @@ export function renderSubagentUiPreview(paths: RuntimePaths, selectedAgentId?: s
 }
 
 class AgentTreeOverlay implements Focusable {
+	private static readonly REFRESH_MS = 750;
+	private cachedTreeByArchived = new Map<boolean, { at: number; nodes: AgentTreeNode[] }>();
+	private cachedDetailByAgentId = new Map<string, { at: number; detail: string }>();
 	focused = false;
 	private selectedIndex = 0;
 	private showArchived = false;
@@ -247,7 +252,18 @@ class AgentTreeOverlay implements Focusable {
 	}
 
 	private getFlatNodes(): AgentTreeNode[] {
-		return flattenAgentTree(this.getNodes(this.showArchived));
+		const now = Date.now();
+		const cached = this.cachedTreeByArchived.get(this.showArchived);
+		const nodes = cached && now - cached.at < AgentTreeOverlay.REFRESH_MS
+			? cached.nodes
+			: this.getAndCacheNodes(this.showArchived, now);
+		return flattenAgentTree(nodes);
+	}
+
+	private getAndCacheNodes(showArchived: boolean, now = Date.now()): AgentTreeNode[] {
+		const nodes = this.getNodes(showArchived);
+		this.cachedTreeByArchived.set(showArchived, { at: now, nodes });
+		return nodes;
 	}
 
 	handleInput(data: string): void {
@@ -268,6 +284,8 @@ class AgentTreeOverlay implements Focusable {
 			const node = nodes[this.selectedIndex];
 			if (node && !node.agent.archived && !node.agent.alive && !node.agent.isRoot) {
 				this.onArchive(node.agent.agentId);
+				this.cachedTreeByArchived.clear();
+				this.cachedDetailByAgentId.clear();
 			}
 			return;
 		}
@@ -275,6 +293,8 @@ class AgentTreeOverlay implements Focusable {
 			const node = nodes[this.selectedIndex];
 			if (node && node.agent.archived) {
 				this.onUnarchive(node.agent.agentId);
+				this.cachedTreeByArchived.clear();
+				this.cachedDetailByAgentId.clear();
 			}
 			return;
 		}
@@ -337,14 +357,26 @@ class AgentTreeOverlay implements Focusable {
 			lines.push(this.theme.fg("border", `╰${"─".repeat(width - 2)}╯`));
 			return lines;
 		}
-		for (const line of wrapPaneText(this.getDetail(agentId), width)) {
+		const now = Date.now();
+		const cached = this.cachedDetailByAgentId.get(agentId);
+		const detail = cached && now - cached.at < AgentTreeOverlay.REFRESH_MS ? cached.detail : this.getAndCacheDetail(agentId, now);
+		for (const line of wrapPaneText(detail, width)) {
 			lines.push(makePaneLine(this.theme, width, line));
 		}
 		lines.push(this.theme.fg("border", `╰${"─".repeat(width - 2)}╯`));
 		return lines;
 	}
 
-	invalidate(): void {}
+	private getAndCacheDetail(agentId: string, now = Date.now()): string {
+		const detail = this.getDetail(agentId);
+		this.cachedDetailByAgentId.set(agentId, { at: now, detail });
+		return detail;
+	}
+
+	invalidate(): void {
+		this.cachedTreeByArchived.clear();
+		this.cachedDetailByAgentId.clear();
+	}
 }
 
 function updateStatus(ctx: ExtensionContext, _paths: RuntimePaths, agent: AgentMeta): void {
@@ -602,7 +634,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
-		const { paths, agent } = loadOrCreateCurrentAgent(ctx.cwd);
+		const { paths, agent } = loadOrCreateCurrentAgent(ctx.cwd, ctx.sessionManager.getSessionFile() ?? undefined);
 		runtimePaths = paths;
 		currentAgent = agent;
 		agent.sessionFile = ctx.sessionManager.getSessionFile() ?? agent.sessionFile;
