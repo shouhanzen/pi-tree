@@ -93,6 +93,7 @@ export interface SpawnOptions {
 	appendSystemPrompt?: string;
 	sessionFile: string;
 	extensionPath?: string;
+	skipFirstUserMessageEvent?: boolean;
 }
 
 function mkdirp(dir: string): void {
@@ -689,6 +690,7 @@ function launchAgentProcess(paths: RuntimePaths, meta: AgentMeta, options: Spawn
 		PI_SUBAGENT_PARENT_ZONE_ID: meta.parentZoneId,
 		PI_SUBAGENT_SEED_VISIBLE_ZONES: JSON.stringify(meta.seedVisibleZoneIds),
 		PI_SUBAGENT_SESSION_FILE: options.sessionFile,
+		...(options.skipFirstUserMessageEvent ? { PI_SUBAGENT_SKIP_FIRST_USER_MESSAGE_EVENT: "1" } : {}),
 	};
 	const child = spawn(invocation.command, invocation.args, {
 		cwd: meta.cwd,

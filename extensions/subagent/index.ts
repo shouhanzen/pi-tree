@@ -574,6 +574,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
 			thinkingLevel: pi.getThinkingLevel(),
 			appendSystemPrompt: buildChildInitSystemPrompt(name ?? "subagent", instructions),
+			skipFirstUserMessageEvent: true,
 		});
 		if (child.agentId !== childAgentId) {
 			throw new Error(`Spawned child id mismatch: expected ${childAgentId}, got ${child.agentId}`);
@@ -645,6 +646,10 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 		if ((message as { customType?: string }).customType === "forkzones-context") return;
 		if (message.role === "user") {
 			const text = extractTextFromContent(message.content);
+			if (process.env.PI_SUBAGENT_SKIP_FIRST_USER_MESSAGE_EVENT === "1") {
+				delete process.env.PI_SUBAGENT_SKIP_FIRST_USER_MESSAGE_EVENT;
+				return;
+			}
 			if (text.trim()) emitZoneEvent(runtimePaths, makeEvent(currentAgent, "user_message", { text }));
 		}
 		if (message.role === "assistant") {
