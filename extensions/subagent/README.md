@@ -12,6 +12,7 @@ This is a first-pass recursive subagent implementation built around the current 
 - each agent owns its own zone
 - zones route events
 - subagents are spawned as background `pi` subprocesses
+- child agents now get their own persistent session files seeded from the parent's realized visible history up to the spawn boundary
 - routed zone events are synced into each agent's local heard log
 - routed context is projected back into the LLM context at turn start
 - projection is now organized around **zone spans** with headers and liveness state instead of one flat routed-context blob
@@ -43,7 +44,7 @@ Important subdirectories:
 ## Tools
 
 Model-facing tools:
-- `spawn_subagent`
+- `spawn_subagent` (`instructions`, optional `name`)
 - `kill_subagent`
 - `join_subagent`
 - `message_subagent`
@@ -59,6 +60,7 @@ Prompting now biases the system toward recursive delegation:
 - root `orca` is instructed to delegate aggressively on broad multi-file or parallelizable work
 - before delegating large writing tasks, the parent should first define module/file splits and explicit contracts
 - before delegating large reading tasks, the parent should first define the investigation split and the questions each child should answer
+- child init uses a dedicated subagent system prompt plus a simple delegated `instructions` string instead of the old markdown snapshot bootstrap blob
 - subagents are also allowed to recurse when the work cleanly decomposes
 
 ## Current limitations

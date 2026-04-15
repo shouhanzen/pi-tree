@@ -1,6 +1,16 @@
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import { complete } from "@mariozechner/pi-ai";
-import { convertToLlm, serializeConversation, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
+import {
+	buildSessionContext,
+	SessionManager,
+	type AgentMessage,
+	type ExtensionAPI,
+	type ExtensionContext,
+	type SessionEntry,
+	convertToLlm,
+	serializeConversation,
+} from "@mariozechner/pi-coding-agent";
+import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { matchesKey, truncateToWidth, wrapTextWithAnsi, type Focusable, type Theme } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
@@ -23,7 +33,7 @@ import {
 	markAgentAlive,
 	readJsonl,
 	renderProjectionMarkdown,
-	renderSessionBranchSnapshot,
+	saveAgentMeta,
 	flattenAgentTree,
 	resumeAgentProcess,
 	randomId,
@@ -344,24 +354,80 @@ function updateStatus(ctx: ExtensionContext, _paths: RuntimePaths, agent: AgentM
 	);
 }
 
-function buildSpawnSnapshot(ctx: ExtensionContext, paths: RuntimePaths, agent: AgentMeta, task: string): string {
-	const entries = ctx.sessionManager.getBranch();
-	const direct = renderSessionBranchSnapshot(entries as unknown[]);
-	const projection = buildProjectionMessage(paths, agent);
+function cloneMessage(message: AgentMessage): AgentMessage {
+	return JSON.parse(JSON.stringify(message)) as AgentMessage;
+}
+
+function truncateAssistantMessageAtToolCall(message: AgentMessage, toolCallId: string): AgentMessage {
+	if (message.role !== "assistant") return cloneMessage(message);
+	const cloned = cloneMessage(message);
+	const blocks = Array.isArray(cloned.content) ? cloned.content : [];
+	const index = blocks.findIndex((block) => block.type === "toolCall" && block.id === toolCallId);
+	if (index === -1) return cloned;
+	cloned.content = blocks.slice(0, index + 1);
+	return cloned;
+}
+
+function buildInheritedMessagesForSpawn(ctx: ExtensionContext, toolCallId: string): AgentMessage[] {
+	const branch = ctx.sessionManager.getBranch() as SessionEntry[];
+	const trimmed: SessionEntry[] = [];
+	for (const entry of branch) {
+		if (entry.type !== "message") {
+			trimmed.push(JSON.parse(JSON.stringify(entry)) as SessionEntry);
+			continue;
+		}
+		const message = entry.message;
+		if (message.role === "assistant" && Array.isArray(message.content)) {
+			const hasTargetToolCall = message.content.some((block) => block.type === "toolCall" && block.id === toolCallId);
+			if (hasTargetToolCall) {
+				trimmed.push({
+					...JSON.parse(JSON.stringify(entry)),
+					message: truncateAssistantMessageAtToolCall(message, toolCallId),
+				} as SessionEntry);
+				break;
+			}
+		}
+		trimmed.push(JSON.parse(JSON.stringify(entry)) as SessionEntry);
+	}
+	const leafId = trimmed.length > 0 ? trimmed[trimmed.length - 1]!.id : null;
+	return buildSessionContext(trimmed, leafId).messages.map((message) => cloneMessage(message));
+}
+
+function createChildSession(
+	ctx: ExtensionContext,
+	paths: RuntimePaths,
+	parent: AgentMeta,
+	toolCallId: string,
+	childAgentId: string,
+): string {
+	const sessionDir = path.join(paths.rootDir, "sessions", childAgentId);
+	const manager = SessionManager.create(ctx.cwd, sessionDir);
+	manager.newSession({ parentSession: ctx.sessionManager.getSessionFile() });
+	for (const message of buildInheritedMessagesForSpawn(ctx, toolCallId)) {
+		manager.appendMessage(cloneMessage(message));
+	}
+	return manager.getSessionFile()!;
+}
+
+function buildChildInitSystemPrompt(agentName: string, instructions: string): string {
 	return [
-		"# Spawn snapshot",
+		`You are ${agentName}, the spawned subagent for this branch.`,
+		"The inherited spawn_subagent tool call is historical context showing that you were created from the parent branch.",
+		"Do not continue the parent assistant turn, do not repeat the parent's spawn_subagent call, and do not act like the parent coordinator.",
+		"Start acting as the spawned child immediately.",
+		"Your delegated instructions are:",
+		instructions,
 		"",
-		`Spawner agent: ${agent.agentId} (${agent.name})`,
-		`Spawner zone: ${agent.zoneId}`,
-		`Snapshot created: ${nowIso()}`,
-		"",
-		direct,
-		"",
-		projection,
-		"",
-		"# Delegated task",
-		"",
-		task,
+		buildDelegationPrompt({
+			agentId: "subagent",
+			name: agentName,
+			zoneId: "zone",
+			seedVisibleZoneIds: [],
+			cwd: "",
+			createdAt: "",
+			alive: true,
+			isRoot: false,
+		}),
 	].join("\n");
 }
 
@@ -394,37 +460,6 @@ async function joinAgentSubtree(
 	}
 }
 
-function buildResumeSnapshot(
-	ctx: ExtensionContext,
-	paths: RuntimePaths,
-	caller: AgentMeta,
-	target: AgentMeta,
-	message: string,
-): string {
-	const callerProjection = buildProjectionMessage(paths, caller);
-	const targetProjection = buildProjectionMessage(paths, target);
-	return [
-		"# Resume snapshot",
-		"",
-		`Caller agent: ${caller.agentId} (${caller.name})`,
-		`Target agent: ${target.agentId} (${target.name})`,
-		`Target zone: ${target.zoneId}`,
-		`Resume created: ${nowIso()}`,
-		"",
-		"# Target conversation view",
-		"",
-		targetProjection || "(no routed projection yet)",
-		"",
-		"# Caller view",
-		"",
-		callerProjection || "(no caller projection)",
-		"",
-		"# New user message",
-		"",
-		message,
-	].join("\n");
-}
-
 async function resumeAgentWithMessage(
 	ctx: ExtensionContext,
 	paths: RuntimePaths,
@@ -436,20 +471,14 @@ async function resumeAgentWithMessage(
 	const target = getAgentMeta(paths, targetAgentId);
 	if (!target) throw new Error(`Unknown agent: ${targetAgentId}`);
 	if (target.archived) throw new Error(`Archived agent cannot receive messages: ${targetAgentId}`);
-	const snapshotMarkdown = buildResumeSnapshot(ctx, paths, caller, target, message);
+	if (!target.sessionFile) throw new Error(`Agent has no persistent session file: ${targetAgentId}`);
 	const resumed = resumeAgentProcess(paths, targetAgentId, {
 		name: target.name,
-		task: message,
-		snapshotMarkdown,
+		prompt: message,
+		sessionFile: target.sessionFile,
 		extensionPath: EXTENSION_FILE_PATH,
 		model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
 		thinkingLevel,
-		appendSystemPrompt: [
-			`You are resuming persistent subagent ${target.name} (${target.agentId}).`,
-			`Keep the same identity, zone, and transcript.`,
-			`Treat the new user message as the next normal turn in this same conversation.`,
-			buildDelegationPrompt(target),
-		].join("\n\n"),
 	});
 	emitZoneEvent(paths, makeEvent(caller, "status", { text: `zone push to ${targetAgentId}` }));
 	return {
@@ -527,30 +556,32 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 		return { agent: currentAgent, paths: runtimePaths };
 	}
 
-	async function spawnAgentFromTask(
-		task: string,
+	async function spawnAgentFromInstructions(
+		instructions: string,
 		name: string | undefined,
 		ctx: ExtensionContext,
+		toolCallId: string,
 	): Promise<AgentToolResult<Record<string, unknown>>> {
 		const { agent, paths } = requireState();
-		const snapshotMarkdown = buildSpawnSnapshot(ctx, paths, agent, task);
+		const childAgentId = randomId("agent");
+		const sessionFile = createChildSession(ctx, paths, agent, toolCallId, childAgentId);
 		const child = spawnChildProcess(paths, agent, {
+			agentId: childAgentId,
 			name,
-			task,
-			snapshotMarkdown,
+			prompt: instructions,
+			sessionFile,
 			extensionPath: EXTENSION_FILE_PATH,
 			model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
 			thinkingLevel: pi.getThinkingLevel(),
-			appendSystemPrompt: buildDelegationPrompt({
-				...agent,
-				isRoot: false,
-				name: name ?? "subagent",
-			}),
+			appendSystemPrompt: buildChildInitSystemPrompt(name ?? "subagent", instructions),
 		});
+		if (child.agentId !== childAgentId) {
+			throw new Error(`Spawned child id mismatch: expected ${childAgentId}, got ${child.agentId}`);
+		}
 		emitZoneEvent(paths, makeEvent(agent, "spawn", {
 			childAgentId: child.agentId,
 			childZoneId: child.zoneId,
-			task,
+			instructions,
 			name: child.name,
 		}));
 		updateStatus(ctx, paths, agent);
@@ -573,7 +604,9 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 		const { paths, agent } = loadOrCreateCurrentAgent(ctx.cwd);
 		runtimePaths = paths;
 		currentAgent = agent;
+		agent.sessionFile = ctx.sessionManager.getSessionFile() ?? agent.sessionFile;
 		markAgentAlive(paths, agent.agentId, true, "alive");
+		saveAgentMeta(paths, agent);
 		refreshForkzoneRuntime(paths, agent);
 		updateStatus(ctx, paths, agent);
 		emitZoneEvent(paths, makeEvent(agent, "status", { text: `agent online pid=${process.pid}` }));
@@ -611,7 +644,8 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 		const message = event.message as { role?: string; content?: unknown; customType?: string };
 		if ((message as { customType?: string }).customType === "forkzones-context") return;
 		if (message.role === "user") {
-			emitZoneEvent(runtimePaths, makeEvent(currentAgent, "user_message", { text: extractTextFromContent(message.content) }));
+			const text = extractTextFromContent(message.content);
+			if (text.trim()) emitZoneEvent(runtimePaths, makeEvent(currentAgent, "user_message", { text }));
 		}
 		if (message.role === "assistant") {
 			const text = extractTextFromContent(message.content);
@@ -670,15 +704,14 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("subagent-spawn", {
-		description: "Spawn a background subagent for a task",
+		description: "Spawn a background subagent with delegated instructions",
 		handler: async (args, ctx) => {
-			const task = args.trim();
-			if (!task) {
-				ctx.ui.notify("Usage: /subagent-spawn <task>", "warning");
+			const instructions = args.trim();
+			if (!instructions) {
+				ctx.ui.notify("Usage: /subagent-spawn <instructions>", "warning");
 				return;
 			}
-			const result = await spawnAgentFromTask(task, undefined, ctx);
-			ctx.ui.notify(extractTextFromContent(result.content), "success");
+			ctx.ui.notify("Use the spawn_subagent tool from an agent turn so the fork boundary can be inherited correctly.", "warning");
 		},
 	});
 
@@ -824,7 +857,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 		name: "spawn_subagent",
 		label: "Spawn Subagent",
 		description:
-			"Spawn a background subagent that inherits the current effective context snapshot and works on a delegated task.",
+			"Spawn a background subagent that inherits the caller's realized visible history through the fork boundary and works from delegated instructions.",
 		promptSnippet: "Spawn a background subagent for substantial delegated work.",
 		promptGuidelines: [
 			"Use this tool for long-running implementation, investigation, or delegated coding work.",
@@ -832,11 +865,11 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			"When the user updates an in-flight task, kill the old subagent and spawn a fresh one instead of trying to message the old one.",
 		],
 		parameters: Type.Object({
-			task: Type.String({ description: "The delegated task for the new subagent" }),
+			instructions: Type.String({ description: "The delegated instructions for the new subagent" }),
 			name: Type.Optional(Type.String({ description: "Optional human-friendly subagent name" })),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			return spawnAgentFromTask(params.task, params.name, ctx);
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			return spawnAgentFromInstructions(params.instructions, params.name, ctx, toolCallId);
 		},
 	});
 

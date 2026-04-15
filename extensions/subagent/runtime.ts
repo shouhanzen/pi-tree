@@ -31,6 +31,7 @@ export interface AgentMeta {
 	parentZoneId?: string;
 	seedVisibleZoneIds: string[];
 	cwd: string;
+	sessionFile?: string;
 	createdAt: string;
 	pid?: number;
 	alive: boolean;
@@ -83,12 +84,14 @@ export interface AgentTreeNode {
 }
 
 export interface SpawnOptions {
+	agentId?: string;
+	zoneId?: string;
 	name?: string;
-	task: string;
+	prompt: string;
 	model?: string;
 	thinkingLevel?: string;
 	appendSystemPrompt?: string;
-	snapshotMarkdown: string;
+	sessionFile: string;
 	extensionPath?: string;
 }
 
@@ -227,6 +230,7 @@ export function loadOrCreateCurrentAgent(cwd: string): { paths: RuntimePaths; ag
 			parentZoneId: process.env.PI_SUBAGENT_PARENT_ZONE_ID || undefined,
 			seedVisibleZoneIds: parseJsonStringArray(process.env.PI_SUBAGENT_SEED_VISIBLE_ZONES) ?? [],
 			cwd,
+			sessionFile: process.env.PI_SUBAGENT_SESSION_FILE || undefined,
 			createdAt: nowIso(),
 			pid: process.pid,
 			alive: true,
@@ -498,7 +502,7 @@ export function summarizeEventForProjection(event: ZoneEvent): string {
 		case "compaction":
 			return `compaction: ${String(event.payload.summary ?? "")}`;
 		case "spawn":
-			return `spawned ${String(event.payload.childAgentId ?? "child")}: ${String(event.payload.task ?? "")}`;
+			return `spawned ${String(event.payload.childAgentId ?? "child")}: ${String(event.payload.instructions ?? event.payload.task ?? "")}`;
 		case "terminal":
 			return `terminal: ${String(event.payload.status ?? "stopped")}`;
 		case "status":
@@ -643,13 +647,6 @@ export function refreshAgentLiveness(paths: RuntimePaths, currentAgentId?: strin
 	return changed;
 }
 
-export function writeSnapshot(paths: RuntimePaths, name: string, markdown: string): string {
-	mkdirp(paths.snapshotsDir);
-	const filePath = path.join(paths.snapshotsDir, `${name}-${Date.now()}.md`);
-	fs.writeFileSync(filePath, markdown, "utf8");
-	return filePath;
-}
-
 export function getPiInvocation(args: string[]): { command: string; args: string[] } {
 	const currentScript = process.argv[1];
 	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
@@ -667,7 +664,6 @@ export function getPiInvocation(args: string[]): { command: string; args: string
 }
 
 function launchAgentProcess(paths: RuntimePaths, meta: AgentMeta, options: SpawnOptions): AgentMeta {
-	const snapshotPath = writeSnapshot(paths, meta.agentId, options.snapshotMarkdown);
 	const appendSystemPrompt =
 		options.appendSystemPrompt ||
 		[
@@ -677,9 +673,10 @@ function launchAgentProcess(paths: RuntimePaths, meta: AgentMeta, options: Spawn
 			`You do not return a special handoff. Do the work and stop when done.`,
 		].join("\n");
 
-	const args = ["-p", "--no-session"];
+	meta.sessionFile = options.sessionFile;
+	const args = ["-p", "--session", options.sessionFile];
 	if (options.extensionPath) args.push("-e", options.extensionPath);
-	args.push(`@${snapshotPath}`, options.task, "--append-system-prompt", appendSystemPrompt);
+	args.push(options.prompt, "--append-system-prompt", appendSystemPrompt);
 	if (options.model) args.push("--model", options.model);
 	if (options.thinkingLevel) args.push("--thinking", options.thinkingLevel);
 	const invocation = getPiInvocation(args);
@@ -691,6 +688,7 @@ function launchAgentProcess(paths: RuntimePaths, meta: AgentMeta, options: Spawn
 		PI_SUBAGENT_PARENT_AGENT_ID: meta.parentAgentId,
 		PI_SUBAGENT_PARENT_ZONE_ID: meta.parentZoneId,
 		PI_SUBAGENT_SEED_VISIBLE_ZONES: JSON.stringify(meta.seedVisibleZoneIds),
+		PI_SUBAGENT_SESSION_FILE: options.sessionFile,
 	};
 	const child = spawn(invocation.command, invocation.args, {
 		cwd: meta.cwd,
@@ -710,8 +708,8 @@ function launchAgentProcess(paths: RuntimePaths, meta: AgentMeta, options: Spawn
 }
 
 export function spawnChildProcess(paths: RuntimePaths, parentAgent: AgentMeta, options: SpawnOptions): AgentMeta {
-	const childAgentId = randomId("agent");
-	const childZoneId = randomId("zone");
+	const childAgentId = options.agentId ?? randomId("agent");
+	const childZoneId = options.zoneId ?? randomId("zone");
 	const childName = options.name?.trim() || childAgentId;
 	const childMeta: AgentMeta = {
 		agentId: childAgentId,
@@ -721,6 +719,7 @@ export function spawnChildProcess(paths: RuntimePaths, parentAgent: AgentMeta, o
 		parentZoneId: parentAgent.zoneId,
 		seedVisibleZoneIds: Array.from(new Set([...buildVisibleZoneIds(paths, parentAgent), childZoneId])),
 		cwd: parentAgent.cwd,
+		sessionFile: options.sessionFile,
 		createdAt: nowIso(),
 		alive: true,
 		archived: false,
