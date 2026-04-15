@@ -446,10 +446,49 @@ export function unarchiveAgentSubtree(paths: RuntimePaths, rootAgentId: string):
 	return changed;
 }
 
+function extractMarkdownSection(text: string, heading: string): string {
+	const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const regex = new RegExp(`${escaped}\\s*([\\s\\S]*?)(?=\\n# |$)`);
+	const match = text.match(regex);
+	return match?.[1]?.trim() ?? "";
+}
+
+function compactBootstrapMessageText(text: string): string {
+	const raw = text.trim();
+	if (!raw.includes("# Spawn snapshot") && !raw.includes("# Resume snapshot")) return raw;
+	const fileRef = raw.match(/^<file name="([^"]+)">/)?.[1];
+	if (raw.includes("# Spawn snapshot")) {
+		const spawner = raw.match(/Spawner agent:\s*(.+)/)?.[1]?.trim();
+		const zone = raw.match(/Spawner zone:\s*(.+)/)?.[1]?.trim();
+		const task = extractMarkdownSection(raw, "# Delegated task");
+		return [
+			`[spawn bootstrap snapshot omitted${fileRef ? `: ${fileRef}` : ""}]`,
+			spawner ? `Spawner: ${spawner}` : "",
+			zone ? `Zone: ${zone}` : "",
+			task ? `Delegated task:\n${task}` : "",
+		]
+			.filter(Boolean)
+			.join("\n");
+	}
+	const caller = raw.match(/Caller agent:\s*(.+)/)?.[1]?.trim();
+	const target = raw.match(/Target agent:\s*(.+)/)?.[1]?.trim();
+	const zone = raw.match(/Target zone:\s*(.+)/)?.[1]?.trim();
+	const message = extractMarkdownSection(raw, "# New user message");
+	return [
+		`[resume bootstrap snapshot omitted${fileRef ? `: ${fileRef}` : ""}]`,
+		caller ? `Caller: ${caller}` : "",
+		target ? `Target: ${target}` : "",
+		zone ? `Zone: ${zone}` : "",
+		message ? `New user message:\n${message}` : "",
+	]
+		.filter(Boolean)
+		.join("\n");
+}
+
 export function summarizeEventForProjection(event: ZoneEvent): string {
 	switch (event.kind) {
 		case "user_message":
-			return `user: ${String(event.payload.text ?? "")}`;
+			return `user: ${compactBootstrapMessageText(String(event.payload.text ?? ""))}`;
 		case "assistant_message":
 			return `assistant: ${String(event.payload.text ?? "")}`;
 		case "tool_call":
