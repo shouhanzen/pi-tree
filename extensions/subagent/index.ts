@@ -76,6 +76,31 @@ function buildProjectionMessage(paths: RuntimePaths, agent: AgentMeta): string {
 	].join("\n");
 }
 
+function buildDelegationPrompt(agent: AgentMeta): string {
+	const rootBehavior = agent.isRoot
+		? [
+			"You are orca, the trunk coordinator. Delegate aggressively.",
+			"If the task is non-trivial, parallelizable, or spans multiple files/modules, prefer spawning subagents instead of doing all work yourself.",
+		]
+		: [
+			"You are a persistent subagent in a recursive agent tree.",
+			"You may also delegate when the task meaningfully splits into parallel or isolated subproblems.",
+		];
+	return [
+		"[SUBAGENT OPERATING MODE]",
+		...rootBehavior,
+		"When there is a lot of code to write, first decide the module/file split yourself.",
+		"Explicitly describe the contract for each module or work packet before delegating.",
+		"Contracts should name responsibilities, expected inputs/outputs, and any key interfaces or invariants.",
+		"Then spawn subagents for the implementation work rather than serially writing every module yourself when the work is decomposable.",
+		"When there is a lot of code to read, first decide the reading split yourself.",
+		"Explicitly describe which files or subsystems each subagent should inspect, and what questions each one should answer.",
+		"After subagents finish, synthesize their results into a single coherent conclusion or plan.",
+		"Prefer crisp task packets with clear boundaries over vague delegation.",
+		"Do not delegate tiny tasks that are faster to do directly.",
+	].join("\n");
+}
+
 function insertProjection(messages: any[], projection: string): any[] {
 	if (!projection.trim()) return messages;
 	const custom = {
@@ -423,7 +448,8 @@ async function resumeAgentWithMessage(
 			`You are resuming persistent subagent ${target.name} (${target.agentId}).`,
 			`Keep the same identity, zone, and transcript.`,
 			`Treat the new user message as the next normal turn in this same conversation.`,
-		].join("\n"),
+			buildDelegationPrompt(target),
+		].join("\n\n"),
 	});
 	emitZoneEvent(paths, makeEvent(caller, "status", { text: `zone push to ${targetAgentId}` }));
 	return {
@@ -515,6 +541,11 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			extensionPath: EXTENSION_FILE_PATH,
 			model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
 			thinkingLevel: pi.getThinkingLevel(),
+			appendSystemPrompt: buildDelegationPrompt({
+				...agent,
+				isRoot: false,
+				name: name ?? "subagent",
+			}),
 		});
 		emitZoneEvent(paths, makeEvent(agent, "spawn", {
 			childAgentId: child.agentId,
@@ -560,9 +591,9 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 		refreshForkzoneRuntime(runtimePaths, currentAgent);
 		updateStatus(ctx, runtimePaths, currentAgent);
 		const projection = buildProjectionMessage(runtimePaths, currentAgent);
-		if (!projection) return;
+		const operatingPrompt = buildDelegationPrompt(currentAgent);
 		return {
-			systemPrompt: `${event.systemPrompt}\n\n${projection}`,
+			systemPrompt: [event.systemPrompt, operatingPrompt, projection].filter((part) => !!part && part.trim().length > 0).join("\n\n"),
 		};
 	});
 
@@ -797,6 +828,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 		promptSnippet: "Spawn a background subagent for substantial delegated work.",
 		promptGuidelines: [
 			"Use this tool for long-running implementation, investigation, or delegated coding work.",
+			"For broad work, first decide the split yourself, define clear contracts for each module or investigation packet, then spawn subagents against those contracts.",
 			"When the user updates an in-flight task, kill the old subagent and spawn a fresh one instead of trying to message the old one.",
 		],
 		parameters: Type.Object({

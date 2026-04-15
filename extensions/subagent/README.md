@@ -53,6 +53,14 @@ User/session-management commands:
 - `/subagent-unarchive`
 - `/subagent-ui`
 
+## Delegation behavior
+
+Prompting now biases the system toward recursive delegation:
+- root `orca` is instructed to delegate aggressively on broad multi-file or parallelizable work
+- before delegating large writing tasks, the parent should first define module/file splits and explicit contracts
+- before delegating large reading tasks, the parent should first define the investigation split and the questions each child should answer
+- subagents are also allowed to recurse when the work cleanly decomposes
+
 ## Current limitations
 
 This is a practical first implementation, not the final ideal runtime.
