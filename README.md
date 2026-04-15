@@ -5,8 +5,8 @@ Recursive subagents, forkzones, and planning notes for experimenting with tree-s
 ## Contents
 
 - `extensions/subagent/` - the subagent/forkzone extension source
-- `skills/grill-me/` - the installed skill source
 - `PLAN.md` - design notes and decisions
+- `PLAN_JOIN.md` - join barrier semantics and design notes
 - `prompts/` - sandbox prompts
 - `run-pi.sh` / `run-pi.cmd` - convenience launchers for local sandbox work
 - `smoke.sh` - simple smoke test launcher
@@ -29,13 +29,6 @@ Primary source files:
 
 A globally installed copy may also exist under:
 - `C:/Users/Hanzen Shou/.pi/agent/extensions/subagent/`
-
-## Skill source
-
-- `skills/grill-me/SKILL.md`
-
-A globally installed copy may also exist under:
-- `C:/Users/Hanzen Shou/.pi/agent/skills/grill-me/`
 
 ## Local runtime artifacts
 

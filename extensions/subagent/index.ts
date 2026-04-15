@@ -11,6 +11,8 @@ import {
 	emitZoneEvent,
 	extractTextFromContent,
 	getAgentMeta,
+	getDescendantAgentIds,
+	isAgentSubtreeAlive,
 	killAgentProcess,
 	loadOrCreateCurrentAgent,
 	markAgentAlive,
@@ -93,6 +95,10 @@ function makeEvent(agent: AgentMeta, kind: ZoneEvent["kind"], payload: Record<st
 	};
 }
 
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function updateStatus(ctx: ExtensionContext, _paths: RuntimePaths, agent: AgentMeta): void {
 	ctx.ui.setStatus(
 		EXTENSION_NAME,
@@ -119,6 +125,35 @@ function buildSpawnSnapshot(ctx: ExtensionContext, paths: RuntimePaths, agent: A
 		"",
 		task,
 	].join("\n");
+}
+
+async function joinAgentSubtree(
+	paths: RuntimePaths,
+	caller: AgentMeta,
+	targetAgentId: string,
+	timeoutSeconds: number | undefined,
+	signal: AbortSignal | undefined,
+): Promise<void> {
+	const target = getAgentMeta(paths, targetAgentId);
+	if (!target) throw new Error(`Unknown agent: ${targetAgentId}`);
+	const deadline = timeoutSeconds && timeoutSeconds > 0 ? Date.now() + timeoutSeconds * 1000 : undefined;
+	while (true) {
+		refreshAgentLiveness(paths, caller.agentId);
+		syncVisibleEvents(paths, caller);
+		if (!isAgentSubtreeAlive(paths, targetAgentId)) break;
+		if (signal?.aborted) throw new Error("Join aborted.");
+		if (deadline && Date.now() > deadline) throw new Error(`Timed out joining ${targetAgentId}.`);
+		await sleep(500);
+	}
+	refreshAgentLiveness(paths, caller.agentId);
+	syncVisibleEvents(paths, caller);
+	const refreshed = getAgentMeta(paths, caller.agentId);
+	if (refreshed) {
+		caller.alive = refreshed.alive;
+		caller.lastStatus = refreshed.lastStatus;
+		caller.lastStatusAt = refreshed.lastStatusAt;
+		caller.pid = refreshed.pid;
+	}
 }
 
 async function buildCompactionSummary(
@@ -360,6 +395,26 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 		},
 	});
 
+	pi.registerCommand("subagent-join", {
+		description: "Wait for a subagent subtree to finish and hydrate its routed messages",
+		handler: async (args, ctx) => {
+			const [agentId, timeoutRaw] = args.trim().split(/\s+/, 2);
+			if (!agentId) {
+				ctx.ui.notify("Usage: /subagent-join <agent-id> [timeout-seconds]", "warning");
+				return;
+			}
+			const timeoutSeconds = timeoutRaw ? Number(timeoutRaw) : undefined;
+			const { agent, paths } = requireState();
+			try {
+				await joinAgentSubtree(paths, agent, agentId, Number.isFinite(timeoutSeconds) ? timeoutSeconds : undefined, ctx.signal);
+				updateStatus(ctx, paths, agent);
+				ctx.ui.notify(`Joined ${agentId}.`, "success");
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+			}
+		},
+	});
+
 	pi.registerTool({
 		name: "spawn_subagent",
 		label: "Spawn Subagent",
@@ -403,6 +458,38 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 				details: { ok: false },
 				isError: true,
 			};
+		},
+	});
+
+	pi.registerTool({
+		name: "join_subagent",
+		label: "Join Subagent",
+		description: "Wait for a subagent subtree to finish, hydrate its new routed messages, and refresh the caller's span view.",
+		promptSnippet: "Wait for a subagent subtree to finish and synchronize its final routed context.",
+		promptGuidelines: [
+			"Use this tool when you need a synchronization barrier before reasoning from a subagent's final state.",
+			"Joining hydrates newly available routed subtree messages into your local context before returning.",
+		],
+		parameters: Type.Object({
+			agentId: Type.String({ description: "The target subagent ID to join" }),
+			timeoutSeconds: Type.Optional(Type.Number({ description: "Optional timeout in seconds. If omitted, wait indefinitely." })),
+		}),
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const { agent, paths } = requireState();
+			try {
+				await joinAgentSubtree(paths, agent, params.agentId, params.timeoutSeconds, signal);
+				updateStatus(ctx, paths, agent);
+				return {
+					content: [{ type: "text", text: `Joined ${params.agentId}.` }],
+					details: { ok: true, joinedAgentId: params.agentId, subtreeAgentIds: getDescendantAgentIds(paths, params.agentId) },
+				};
+			} catch (error) {
+				return {
+					content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+					details: { ok: false },
+					isError: true,
+				};
+			}
 		},
 	});
 

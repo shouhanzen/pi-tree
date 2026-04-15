@@ -279,7 +279,7 @@ export function emitZoneEvent(paths: RuntimePaths, event: ZoneEvent): void {
 	appendJsonl(getZoneEventPath(paths, event.zoneId), event);
 }
 
-export function buildVisibleZoneIds(paths: RuntimePaths, agent: AgentMeta): string[] {
+function buildChildZoneIdsByParent(paths: RuntimePaths): Map<string, string[]> {
 	const zones = listZoneMetas(paths);
 	const childrenByParent = new Map<string, string[]>();
 	for (const zone of zones) {
@@ -288,6 +288,11 @@ export function buildVisibleZoneIds(paths: RuntimePaths, agent: AgentMeta): stri
 		current.push(zone.zoneId);
 		childrenByParent.set(zone.parentZoneId, current);
 	}
+	return childrenByParent;
+}
+
+export function buildVisibleZoneIds(paths: RuntimePaths, agent: AgentMeta): string[] {
+	const childrenByParent = buildChildZoneIdsByParent(paths);
 	const seen = new Set<string>();
 	const ordered: string[] = [];
 	const queue = [...agent.seedVisibleZoneIds];
@@ -300,6 +305,42 @@ export function buildVisibleZoneIds(paths: RuntimePaths, agent: AgentMeta): stri
 	}
 	if (!seen.has(agent.zoneId)) ordered.push(agent.zoneId);
 	return ordered;
+}
+
+export function getDescendantZoneIds(paths: RuntimePaths, rootZoneId: string): string[] {
+	const childrenByParent = buildChildZoneIdsByParent(paths);
+	const ordered: string[] = [];
+	const queue = [rootZoneId];
+	const seen = new Set<string>();
+	while (queue.length > 0) {
+		const zoneId = queue.shift();
+		if (!zoneId || seen.has(zoneId)) continue;
+		seen.add(zoneId);
+		ordered.push(zoneId);
+		for (const childZoneId of childrenByParent.get(zoneId) ?? []) queue.push(childZoneId);
+	}
+	return ordered;
+}
+
+export function getDescendantAgentIds(paths: RuntimePaths, rootAgentId: string): string[] {
+	const rootAgent = getAgentMeta(paths, rootAgentId);
+	if (!rootAgent) return [];
+	const zoneMap = new Map(listZoneMetas(paths).map((zone) => [zone.zoneId, zone]));
+	const descendantZoneIds = getDescendantZoneIds(paths, rootAgent.zoneId);
+	const descendantAgentIds: string[] = [];
+	for (const zoneId of descendantZoneIds) {
+		const zone = zoneMap.get(zoneId);
+		if (zone) descendantAgentIds.push(zone.ownerAgentId);
+	}
+	return descendantAgentIds;
+}
+
+export function isAgentSubtreeAlive(paths: RuntimePaths, rootAgentId: string): boolean {
+	for (const agentId of getDescendantAgentIds(paths, rootAgentId)) {
+		const meta = getAgentMeta(paths, agentId);
+		if (meta?.alive) return true;
+	}
+	return false;
 }
 
 export function syncVisibleEvents(paths: RuntimePaths, agent: AgentMeta): HeardRecord[] {

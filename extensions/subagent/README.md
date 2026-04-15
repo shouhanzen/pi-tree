@@ -28,11 +28,13 @@ Important subdirectories:
 
 - `/subagent-spawn <task>` - spawn a background subagent
 - `/subagent-kill <agent-id>` - kill a running subagent
+- `/subagent-join <agent-id> [timeout-seconds]` - wait for a subagent subtree to finish and hydrate its routed messages
 
 ## Tools
 
 - `spawn_subagent`
 - `kill_subagent`
+- `join_subagent`
 
 ## Current limitations
 
@@ -41,7 +43,7 @@ This is a practical first implementation, not the final ideal runtime.
 Known gaps:
 - span projection is still simplified compared with the full ideal model
 - custom per-agent compaction exists but still needs refinement
-- runtime liveness cleanup is better than before, but still not production-hardened
+- runtime liveness cleanup and join barriers work, but still are not production-hardened
 - routed context is persisted in extension-managed files, not deeply integrated into pi session history
 - UI is intentionally minimal
 
